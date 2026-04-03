@@ -29,8 +29,27 @@ class StepType(StrEnum):
 
     ROUTE_HANDLED = "route_handled"
     LLM_RESPONSE = "llm_response"
-    TOOL_CALL = "tool_call"
+    LLM_CHUNK = "llm_chunk"
     TOOL_RESULT = "tool_result"
+
+
+class ContentType(StrEnum):
+    """Type of content part in a multimodal event."""
+
+    TEXT = "text"
+    IMAGE = "image"
+    FILE = "file"
+
+
+class ContentPart(BaseModel):
+    """A single part of multimodal content."""
+
+    type: ContentType
+    text: str | None = None
+    mime_type: str | None = None
+    data: bytes | None = None
+    uri: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class ThinkingConfig(BaseModel):
@@ -47,6 +66,7 @@ class GenerateConfig(BaseModel):
     max_tokens: int | None = None
     stop_sequences: list[str] | None = None
     thinking: ThinkingConfig | None = None
+    response_schema: dict[str, Any] | None = None
     provider_config: dict[str, Any] | None = None
 
 
@@ -75,3 +95,13 @@ class LLMResponse(BaseModel):
     usage: UsageMetadata | None = None
     thinking: str | None = None
     model: str | None = None
+
+
+class LLMChunk(BaseModel):
+    """A single chunk from an LLM streaming response."""
+
+    content_delta: str | None = None
+    tool_calls: list[ToolCallData] | None = None
+    thinking_delta: str | None = None
+    usage: UsageMetadata | None = None
+    finished: bool = False

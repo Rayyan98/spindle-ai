@@ -8,7 +8,7 @@ Converts between Spindle Events and Gemini message format.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, AsyncGenerator
 
 from google import genai
 from google.genai import types
@@ -16,9 +16,11 @@ from google.genai import types
 from ..event import Event
 from ..tool import Tool
 from ..types import (
+    ContentType,
     EventRole,
     EventType,
     GenerateConfig,
+    LLMChunk,
     LLMResponse,
     ToolCallData,
     UsageMetadata,
@@ -70,6 +72,68 @@ class GeminiLLM(LLM):
 
         return _parse_response(response)
 
+    async def stream(
+        self,
+        history: list[Event],
+        *,
+        system_prompt: str | None = None,
+        tools: list[Tool] | None = None,
+        config: GenerateConfig | None = None,
+    ) -> AsyncGenerator[LLMChunk, None]:
+        contents = _events_to_contents(history)
+        gen_config = _build_generate_config(system_prompt, tools, config)
+
+        accumulated_tool_calls: list[ToolCallData] = []
+        last_usage: UsageMetadata | None = None
+
+        async for chunk in await self._client.aio.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=gen_config,
+        ):
+            content_delta = None
+            thinking_delta = None
+
+            if chunk.candidates:
+                candidate = chunk.candidates[0]
+                if candidate.content and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        if part.function_call:
+                            accumulated_tool_calls.append(
+                                ToolCallData(
+                                    id=f"call_{part.function_call.name}_{id(part)}",
+                                    name=part.function_call.name,
+                                    args=dict(part.function_call.args)
+                                    if part.function_call.args
+                                    else {},
+                                )
+                            )
+                        elif part.thought:
+                            thinking_delta = part.text or ""
+                        elif part.text:
+                            content_delta = part.text
+
+            if chunk.usage_metadata:
+                last_usage = UsageMetadata(
+                    input_tokens=chunk.usage_metadata.prompt_token_count or 0,
+                    output_tokens=chunk.usage_metadata.candidates_token_count or 0,
+                    total_tokens=chunk.usage_metadata.total_token_count or 0,
+                    thinking_tokens=getattr(chunk.usage_metadata, "thoughts_token_count", None),
+                )
+
+            yield LLMChunk(
+                content_delta=content_delta,
+                thinking_delta=thinking_delta,
+                finished=False,
+            )
+
+        # Final chunk with accumulated tool calls and usage
+        yield LLMChunk(
+            tool_calls=accumulated_tool_calls if accumulated_tool_calls else None,
+            usage=last_usage,
+            finished=True,
+        )
+
 
 # -- Conversion: Spindle Events -> Gemini Contents --------------------------
 
@@ -81,12 +145,49 @@ def _events_to_contents(events: list[Event]) -> list[types.Content]:
     for event in events:
         if event.type == EventType.MESSAGE:
             role = "user" if event.role == EventRole.USER else "model"
-            contents.append(
-                types.Content(
-                    role=role,
-                    parts=[types.Part(text=event.content or "")],
+
+            # Multimodal parts
+            if event.parts:
+                gemini_parts = []
+                for part in event.parts:
+                    if part.type == ContentType.TEXT and part.text:
+                        gemini_parts.append(types.Part(text=part.text))
+                    elif part.type == ContentType.IMAGE:
+                        if part.data and part.mime_type:
+                            gemini_parts.append(
+                                types.Part(
+                                    inline_data=types.Blob(mime_type=part.mime_type, data=part.data)
+                                )
+                            )
+                        elif part.uri:
+                            gemini_parts.append(
+                                types.Part(
+                                    file_data=types.FileData(
+                                        file_uri=part.uri,
+                                        mime_type=part.mime_type or "image/jpeg",
+                                    )
+                                )
+                            )
+                    elif part.type == ContentType.FILE:
+                        if part.uri:
+                            gemini_parts.append(
+                                types.Part(
+                                    file_data=types.FileData(
+                                        file_uri=part.uri,
+                                        mime_type=part.mime_type or "application/octet-stream",
+                                    )
+                                )
+                            )
+
+                if gemini_parts:
+                    contents.append(types.Content(role=role, parts=gemini_parts))
+            else:
+                contents.append(
+                    types.Content(
+                        role=role,
+                        parts=[types.Part(text=event.content or "")],
+                    )
                 )
-            )
 
         elif event.type == EventType.TOOL_CALL:
             contents.append(
@@ -201,6 +302,9 @@ def _build_generate_config(
             kwargs["thinking_config"] = types.ThinkingConfig(
                 thinking_budget=config.thinking.budget or 4096,
             )
+        if config.response_schema:
+            kwargs["response_mime_type"] = "application/json"
+            kwargs["response_schema"] = config.response_schema
 
     return types.GenerateContentConfig(**kwargs)
 
@@ -248,6 +352,7 @@ def _parse_response(response: types.GenerateContentResponse) -> LLMResponse:
             input_tokens=response.usage_metadata.prompt_token_count or 0,
             output_tokens=response.usage_metadata.candidates_token_count or 0,
             total_tokens=response.usage_metadata.total_token_count or 0,
+            thinking_tokens=getattr(response.usage_metadata, "thoughts_token_count", None),
         )
 
     return LLMResponse(

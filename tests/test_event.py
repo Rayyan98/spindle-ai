@@ -3,7 +3,7 @@
 import pytest
 
 from spindle.event import Event
-from spindle.types import EventRole, EventType
+from spindle.types import ContentPart, ContentType, EventRole, EventType
 
 
 # -- Factory Methods --------------------------------------------------------
@@ -34,6 +34,47 @@ class TestUserMessage:
     def test_generates_timestamp(self):
         event = Event.user_message("hello")
         assert event.timestamp > 0
+
+    def test_no_parts_by_default(self):
+        event = Event.user_message("hello")
+        assert event.parts is None
+
+    def test_with_images(self):
+        event = Event.user_message("What's this?", images=["gs://bucket/photo.jpg"])
+        assert event.parts is not None
+        assert len(event.parts) == 2
+        assert event.parts[0].type == ContentType.TEXT
+        assert event.parts[0].text == "What's this?"
+        assert event.parts[1].type == ContentType.IMAGE
+        assert event.parts[1].uri == "gs://bucket/photo.jpg"
+
+    def test_content_preserved_with_images(self):
+        event = Event.user_message("describe", images=["gs://bucket/img.png"])
+        assert event.content == "describe"
+
+
+class TestUserMultimodal:
+    def test_creates_from_parts(self):
+        parts = [
+            ContentPart(type=ContentType.TEXT, text="What's in this image?"),
+            ContentPart(type=ContentType.IMAGE, uri="gs://bucket/photo.jpg"),
+        ]
+        event = Event.user_multimodal(parts)
+        assert event.role == EventRole.USER
+        assert event.parts == parts
+
+    def test_extracts_text_content(self):
+        parts = [
+            ContentPart(type=ContentType.TEXT, text="Hello"),
+            ContentPart(type=ContentType.IMAGE, uri="gs://bucket/img.png"),
+        ]
+        event = Event.user_multimodal(parts)
+        assert event.content == "Hello"
+
+    def test_no_text_parts(self):
+        parts = [ContentPart(type=ContentType.IMAGE, uri="gs://bucket/img.png")]
+        event = Event.user_multimodal(parts)
+        assert event.content is None
 
 
 class TestAgentMessage:
@@ -153,3 +194,11 @@ class TestSerialization:
         json_str = original.model_dump_json()
         restored = Event.model_validate_json(json_str)
         assert restored == original
+
+    def test_roundtrip_multimodal(self):
+        original = Event.user_message("describe", images=["gs://bucket/img.png"])
+        data = original.model_dump()
+        restored = Event.model_validate(data)
+        assert restored == original
+        assert restored.parts is not None
+        assert len(restored.parts) == 2

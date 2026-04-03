@@ -12,7 +12,7 @@ from typing import Any
 
 from .event import Event
 from .stores.base import Store
-from .types import EventRole, EventType
+from .types import ContentPart, EventRole, EventType
 
 
 class Session:
@@ -45,9 +45,25 @@ class Session:
 
     # -- Add Events ---------------------------------------------------------
 
-    def add_user_message(self, text: str, *, metadata: dict[str, Any] | None = None) -> Event:
+    def add_user_message(
+        self,
+        text: str,
+        *,
+        images: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Event:
         """Add a user message to the session."""
-        event = Event.user_message(text, metadata=metadata)
+        event = Event.user_message(text, images=images, metadata=metadata)
+        return self._append(event)
+
+    def add_user_multimodal(
+        self,
+        parts: list[ContentPart],
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> Event:
+        """Add a multimodal user message to the session."""
+        event = Event.user_multimodal(parts, metadata=metadata)
         return self._append(event)
 
     def add_agent_message(

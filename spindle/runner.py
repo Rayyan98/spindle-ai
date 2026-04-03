@@ -8,6 +8,7 @@ or stop. Nothing happens until you pull the next value.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator
@@ -15,7 +16,7 @@ from typing import Any, AsyncGenerator
 from .agent import Agent
 from .session import Session
 from .tool import Tool
-from .types import GenerateConfig, StepType
+from .types import GenerateConfig, StepType, ToolCallData
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +27,14 @@ class Step:
 
     type: StepType
     content: str | None = None
+    tool_calls: list[ToolCallData] | None = None
     tool_name: str | None = None
     tool_args: dict[str, Any] | None = None
     tool_result: Any = None
     tool_call_id: str | None = None
     usage: Any = None
     thinking: str | None = None
+    partial: bool = False
 
 
 class Runner:
@@ -49,6 +52,7 @@ class Runner:
         tools: list[Tool] | None = None,
         config: GenerateConfig | None = None,
         metadata: dict[str, Any] | None = None,
+        stream: bool = False,
     ) -> AsyncGenerator[Step, None]:
         """Run the agent loop as a lazy async generator.
 
@@ -59,6 +63,7 @@ class Runner:
             tools: Override the agent's tools for this run.
             config: Generation config override for this run.
             metadata: Metadata passed to the router.
+            stream: If True, yield LLM_CHUNK steps with partial text deltas.
         """
         # Add user message to session
         session.add_user_message(message)
@@ -77,41 +82,63 @@ class Runner:
 
         # Agent loop — LLM call → tool execution → repeat
         while True:
-            response = await self.agent.llm.generate(
-                session.events,
-                system_prompt=effective_prompt,
-                tools=effective_tools if effective_tools else None,
-                config=config,
-            )
-
-            # Handle text response
-            if response.content:
-                session.add_agent_message(response.content, author=self.agent.name)
-                yield Step(
-                    type=StepType.LLM_RESPONSE,
-                    content=response.content,
-                    usage=response.usage,
-                    thinking=response.thinking,
+            if stream:
+                response = None
+                async for step in self._stream_llm(
+                    session, effective_prompt, effective_tools, config
+                ):
+                    yield step
+                    if not step.partial and step.type == StepType.LLM_RESPONSE:
+                        response = step
+            else:
+                llm_response = await self.agent.llm.generate(
+                    session.events,
+                    system_prompt=effective_prompt,
+                    tools=effective_tools if effective_tools else None,
+                    config=config,
                 )
 
+                # Add agent message to session if there's text content
+                if llm_response.content:
+                    meta = {}
+                    if llm_response.thinking:
+                        meta["thinking"] = llm_response.thinking
+                    session.add_agent_message(
+                        llm_response.content,
+                        author=self.agent.name,
+                        metadata=meta or None,
+                    )
+
+                # Yield LLM_RESPONSE — the semantic unit from the LLM
+                response = Step(
+                    type=StepType.LLM_RESPONSE,
+                    content=llm_response.content,
+                    tool_calls=llm_response.tool_calls,
+                    usage=llm_response.usage,
+                    thinking=llm_response.thinking,
+                )
+                yield response
+
             # No tool calls — turn complete
-            if not response.tool_calls:
+            if not response or not response.tool_calls:
                 break
 
-            # Execute tool calls
+            # Execute tool calls in parallel
+            call_events = []
             for tc in response.tool_calls:
                 call_event = session.add_tool_call(
                     tc.name, tc.args, author=self.agent.name, call_id=tc.id
                 )
-                yield Step(
-                    type=StepType.TOOL_CALL,
-                    tool_name=tc.name,
-                    tool_args=tc.args,
-                    tool_call_id=tc.id,
-                )
+                call_events.append((tc, call_event))
 
-                # Execute the tool
-                result = await _execute_tool(tool_map, tc.name, tc.args)
+            results = await asyncio.gather(
+                *[_execute_tool(tool_map, tc.name, tc.args) for tc, _ in call_events],
+                return_exceptions=True,
+            )
+
+            for (tc, call_event), result in zip(call_events, results):
+                if isinstance(result, BaseException):
+                    result = {"error": str(result)}
 
                 session.add_tool_result(tc.name, result, call_id=call_event.tool_call_id)
                 yield Step(
@@ -120,6 +147,64 @@ class Runner:
                     tool_result=result,
                     tool_call_id=call_event.tool_call_id,
                 )
+
+    async def _stream_llm(
+        self,
+        session: Session,
+        system_prompt: str | None,
+        tools: list[Tool],
+        config: GenerateConfig | None,
+    ) -> AsyncGenerator[Step, None]:
+        """Stream LLM response, yielding chunks then a final LLM_RESPONSE."""
+        accumulated_text = ""
+        accumulated_thinking = ""
+        accumulated_tool_calls: list[ToolCallData] | None = None
+        last_usage = None
+
+        async for chunk in self.agent.llm.stream(
+            session.events,
+            system_prompt=system_prompt,
+            tools=tools if tools else None,
+            config=config,
+        ):
+            if chunk.content_delta:
+                accumulated_text += chunk.content_delta
+                yield Step(
+                    type=StepType.LLM_CHUNK,
+                    content=chunk.content_delta,
+                    partial=True,
+                )
+
+            if chunk.thinking_delta:
+                accumulated_thinking += chunk.thinking_delta
+
+            if chunk.tool_calls:
+                accumulated_tool_calls = chunk.tool_calls
+
+            if chunk.usage:
+                last_usage = chunk.usage
+
+        # Add agent message to session
+        final_text = accumulated_text or None
+        if final_text:
+            meta = {}
+            if accumulated_thinking:
+                meta["thinking"] = accumulated_thinking
+            session.add_agent_message(
+                final_text,
+                author=self.agent.name,
+                metadata=meta or None,
+            )
+
+        # Yield final LLM_RESPONSE step
+        yield Step(
+            type=StepType.LLM_RESPONSE,
+            content=final_text,
+            tool_calls=accumulated_tool_calls,
+            usage=last_usage,
+            thinking=accumulated_thinking or None,
+            partial=False,
+        )
 
 
 async def _execute_tool(tool_map: dict[str, Tool], name: str, args: dict[str, Any]) -> Any:

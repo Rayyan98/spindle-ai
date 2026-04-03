@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .types import EventRole, EventType
+from .types import ContentPart, ContentType, EventRole, EventType
 
 
 def _new_id() -> str:
@@ -33,6 +33,7 @@ class Event(BaseModel):
     type: EventType
     author: str
     content: str | None = None
+    parts: list[ContentPart] | None = None
     tool_name: str | None = None
     tool_args: dict[str, Any] | None = None
     tool_result_data: Any | None = None
@@ -42,13 +43,50 @@ class Event(BaseModel):
     # -- Factory Methods ----------------------------------------------------
 
     @staticmethod
-    def user_message(text: str, *, metadata: dict[str, Any] | None = None) -> "Event":
-        """Create a user message event."""
+    def user_message(
+        text: str,
+        *,
+        images: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> "Event":
+        """Create a user message event.
+
+        Args:
+            text: The message text.
+            images: Optional list of image URIs to include as multimodal parts.
+            metadata: Arbitrary key-value metadata.
+        """
+        parts = None
+        if images:
+            parts = [ContentPart(type=ContentType.TEXT, text=text)]
+            for uri in images:
+                parts.append(ContentPart(type=ContentType.IMAGE, uri=uri))
+
         return Event(
             role=EventRole.USER,
             type=EventType.MESSAGE,
             author="user",
             content=text,
+            parts=parts,
+            metadata=metadata,
+        )
+
+    @staticmethod
+    def user_multimodal(
+        parts: list[ContentPart],
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> "Event":
+        """Create a user event with explicit multimodal parts."""
+        text_parts = [p.text for p in parts if p.type == ContentType.TEXT and p.text]
+        text_content = "".join(text_parts) if text_parts else None
+
+        return Event(
+            role=EventRole.USER,
+            type=EventType.MESSAGE,
+            author="user",
+            content=text_content,
+            parts=parts,
             metadata=metadata,
         )
 

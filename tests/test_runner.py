@@ -8,6 +8,7 @@ from spindle.tool import tool
 from spindle.types import (
     EventType,
     GenerateConfig,
+    LLMChunk,
     LLMResponse,
     StepType,
     ToolCallData,
@@ -36,8 +37,8 @@ async def failing_tool(x: int) -> dict:
     raise ValueError("something broke")
 
 
-def _make_agent(responses: list[LLMResponse], tools=None, router=None, instruction=None):
-    llm = MockLLM(responses)
+def _make_agent(responses, tools=None, router=None, instruction=None, chunks=None):
+    llm = MockLLM(responses, chunks=chunks)
     return Agent(
         name="test_agent",
         llm=llm,
@@ -80,11 +81,12 @@ class TestTextResponse:
         assert session.events[1].role.value == "agent"
 
 
-# -- Tool Calling -----------------------------------------------------------
+# -- Semantic Grouping ------------------------------------------------------
 
 
-class TestToolCalling:
-    async def test_yields_tool_call_step(self):
+class TestSemanticGrouping:
+    async def test_llm_response_carries_tool_calls(self):
+        """LLM_RESPONSE step includes tool_calls when LLM wants to call tools."""
         agent = _make_agent(
             [
                 LLMResponse(
@@ -100,9 +102,68 @@ class TestToolCalling:
         session = Session(id="s1", user_id="u1")
 
         steps = [step async for step in runner.run(session, "add 2 and 3")]
-        step_types = [s.type for s in steps]
-        assert StepType.TOOL_CALL in step_types
+        llm_steps = [s for s in steps if s.type == StepType.LLM_RESPONSE]
 
+        # First LLM response has tool calls
+        assert llm_steps[0].tool_calls is not None
+        assert llm_steps[0].tool_calls[0].name == "add"
+
+        # Second LLM response has text
+        assert llm_steps[1].content == "The answer is 5."
+        assert llm_steps[1].tool_calls is None
+
+    async def test_text_and_tool_calls_in_one_step(self):
+        """When LLM returns both text and tool calls, they're in one step."""
+        agent = _make_agent(
+            [
+                LLMResponse(
+                    content="Let me search for that.",
+                    tool_calls=[
+                        ToolCallData(id="c1", name="search", args={"query": "laptop"}),
+                    ],
+                ),
+                LLMResponse(content="Found 2 results."),
+            ],
+            tools=[search],
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "find laptops")]
+        first = steps[0]
+
+        assert first.type == StepType.LLM_RESPONSE
+        assert first.content == "Let me search for that."
+        assert first.tool_calls is not None
+        assert first.tool_calls[0].name == "search"
+
+    async def test_no_separate_tool_call_steps(self):
+        """StepType for tool_call should not appear as a yielded step."""
+        agent = _make_agent(
+            [
+                LLMResponse(
+                    tool_calls=[
+                        ToolCallData(id="c1", name="add", args={"a": 1, "b": 2}),
+                    ]
+                ),
+                LLMResponse(content="3"),
+            ],
+            tools=[add],
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "add")]
+        step_types = [s.type for s in steps]
+        assert StepType.LLM_RESPONSE in step_types
+        assert StepType.TOOL_RESULT in step_types
+        assert all(t in (StepType.LLM_RESPONSE, StepType.TOOL_RESULT) for t in step_types)
+
+
+# -- Tool Calling -----------------------------------------------------------
+
+
+class TestToolCalling:
     async def test_yields_tool_result_step(self):
         agent = _make_agent(
             [
@@ -182,10 +243,14 @@ class TestToolCalling:
         session = Session(id="s1", user_id="u1")
 
         steps = [step async for step in runner.run(session, "add both")]
-        tool_call_steps = [s for s in steps if s.type == StepType.TOOL_CALL]
-        tool_result_steps = [s for s in steps if s.type == StepType.TOOL_RESULT]
-        assert len(tool_call_steps) == 2
-        assert len(tool_result_steps) == 2
+
+        # LLM_RESPONSE carries both tool calls
+        llm_step = [s for s in steps if s.type == StepType.LLM_RESPONSE][0]
+        assert len(llm_step.tool_calls) == 2
+
+        # Two TOOL_RESULT steps
+        result_steps = [s for s in steps if s.type == StepType.TOOL_RESULT]
+        assert len(result_steps) == 2
 
     async def test_tool_error_returns_error_result(self):
         agent = _make_agent(
@@ -205,6 +270,66 @@ class TestToolCalling:
         steps = [step async for step in runner.run(session, "do thing")]
         result_steps = [s for s in steps if s.type == StepType.TOOL_RESULT]
         assert "error" in str(result_steps[0].tool_result).lower()
+
+
+# -- Parallel Tool Execution -----------------------------------------------
+
+
+class TestParallelToolExecution:
+    async def test_parallel_results_all_returned(self):
+        """All tool call results should be returned even when run in parallel."""
+        agent = _make_agent(
+            [
+                LLMResponse(
+                    tool_calls=[
+                        ToolCallData(id="c1", name="add", args={"a": 1, "b": 2}),
+                        ToolCallData(id="c2", name="add", args={"a": 10, "b": 20}),
+                        ToolCallData(id="c3", name="add", args={"a": 100, "b": 200}),
+                    ]
+                ),
+                LLMResponse(content="Done."),
+            ],
+            tools=[add],
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "add all")]
+        results = [s.tool_result for s in steps if s.type == StepType.TOOL_RESULT]
+        assert sorted(results) == [3, 30, 300]
+
+    async def test_parallel_one_failure_others_succeed(self):
+        """If one tool fails, others still return results."""
+
+        @tool
+        async def maybe_fail(x: int) -> int:
+            """Maybe fail."""
+            if x == 2:
+                raise ValueError("boom")
+            return x * 10
+
+        agent = _make_agent(
+            [
+                LLMResponse(
+                    tool_calls=[
+                        ToolCallData(id="c1", name="maybe_fail", args={"x": 1}),
+                        ToolCallData(id="c2", name="maybe_fail", args={"x": 2}),
+                        ToolCallData(id="c3", name="maybe_fail", args={"x": 3}),
+                    ]
+                ),
+                LLMResponse(content="Done."),
+            ],
+            tools=[maybe_fail],
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "run all")]
+        results = [s for s in steps if s.type == StepType.TOOL_RESULT]
+
+        assert results[0].tool_result == 10
+        assert "error" in str(results[1].tool_result).lower()
+        assert results[2].tool_result == 30
 
 
 # -- Router Integration ----------------------------------------------------
@@ -270,42 +395,36 @@ class TestRouterIntegration:
 
 class TestPullBasedControl:
     async def test_stop_early_via_break(self):
-        """Breaking from the generator stops the agent — no more work done."""
-        call_count = 0
-
-        @tool
-        async def slow_tool(x: int) -> int:
-            nonlocal call_count
-            call_count += 1
-            return x
-
+        """Breaking from the generator stops yielding further steps."""
         agent = _make_agent(
             [
                 LLMResponse(
                     tool_calls=[
-                        ToolCallData(id="c1", name="slow_tool", args={"x": 1}),
-                        ToolCallData(id="c2", name="slow_tool", args={"x": 2}),
-                        ToolCallData(id="c3", name="slow_tool", args={"x": 3}),
+                        ToolCallData(id="c1", name="add", args={"a": 1, "b": 2}),
+                        ToolCallData(id="c2", name="add", args={"a": 3, "b": 4}),
+                        ToolCallData(id="c3", name="add", args={"a": 5, "b": 6}),
                     ]
                 ),
                 LLMResponse(content="Done"),
             ],
-            tools=[slow_tool],
+            tools=[add],
         )
         runner = Runner(agent=agent)
         session = Session(id="s1", user_id="u1")
 
-        step_count = 0
+        collected = []
         async for step in runner.run(session, "do 3 things"):
-            step_count += 1
-            if step_count >= 2:
+            collected.append(step)
+            if len(collected) >= 2:
                 break
 
-        # Should have stopped before processing all tool calls
-        assert call_count < 3
+        # First step is LLM_RESPONSE, then we only got 1 TOOL_RESULT before breaking
+        assert collected[0].type == StepType.LLM_RESPONSE
+        assert collected[1].type == StepType.TOOL_RESULT
+        assert len(collected) == 2
 
     async def test_mid_run_injection(self):
-        """Inject a user message between tool call and next LLM call."""
+        """Inject a user message between tool result and next LLM call."""
         agent = _make_agent(
             [
                 LLMResponse(
@@ -328,6 +447,99 @@ class TestPullBasedControl:
         user_messages = [e for e in session.events if e.role.value == "user"]
         assert len(user_messages) == 2
         assert user_messages[1].content == "only show Riyadh suppliers"
+
+
+# -- Thinking ---------------------------------------------------------------
+
+
+class TestThinking:
+    async def test_thinking_flows_to_step(self):
+        agent = _make_agent([LLMResponse(content="Paris", thinking="France's capital is Paris")])
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "capital of France?")]
+        assert steps[0].thinking == "France's capital is Paris"
+
+    async def test_thinking_stored_in_event_metadata(self):
+        agent = _make_agent([LLMResponse(content="42", thinking="The answer to everything")])
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        [step async for step in runner.run(session, "meaning of life?")]
+
+        agent_event = session.events[1]
+        assert agent_event.metadata is not None
+        assert agent_event.metadata["thinking"] == "The answer to everything"
+
+
+# -- Streaming --------------------------------------------------------------
+
+
+class TestStreaming:
+    async def test_stream_yields_chunks_then_response(self):
+        agent = _make_agent(
+            [LLMResponse(content="Hello world")],
+            chunks=[
+                [
+                    LLMChunk(content_delta="Hello ", finished=False),
+                    LLMChunk(content_delta="world", finished=False),
+                    LLMChunk(finished=True),
+                ]
+            ],
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "hi", stream=True)]
+
+        chunk_steps = [s for s in steps if s.type == StepType.LLM_CHUNK]
+        assert len(chunk_steps) == 2
+        assert chunk_steps[0].content == "Hello "
+        assert chunk_steps[1].content == "world"
+        assert all(s.partial for s in chunk_steps)
+
+        response_steps = [s for s in steps if s.type == StepType.LLM_RESPONSE]
+        assert len(response_steps) == 1
+        assert response_steps[0].content == "Hello world"
+        assert not response_steps[0].partial
+
+    async def test_stream_false_is_default(self):
+        agent = _make_agent([LLMResponse(content="Hi!")])
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "hello")]
+        assert all(s.type != StepType.LLM_CHUNK for s in steps)
+
+    async def test_stream_with_tool_calls(self):
+        agent = _make_agent(
+            [LLMResponse(content="ok")],
+            tools=[add],
+            chunks=[
+                [
+                    LLMChunk(content_delta="Let me ", finished=False),
+                    LLMChunk(content_delta="add.", finished=False),
+                    LLMChunk(
+                        tool_calls=[ToolCallData(id="c1", name="add", args={"a": 1, "b": 2})],
+                        finished=True,
+                    ),
+                ],
+                [
+                    LLMChunk(content_delta="The answer is 3.", finished=False),
+                    LLMChunk(finished=True),
+                ],
+            ],
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "add 1+2", stream=True)]
+
+        step_types = [s.type for s in steps]
+        assert StepType.LLM_CHUNK in step_types
+        assert StepType.LLM_RESPONSE in step_types
+        assert StepType.TOOL_RESULT in step_types
 
 
 # -- Per-message Overrides --------------------------------------------------

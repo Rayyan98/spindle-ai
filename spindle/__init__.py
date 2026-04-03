@@ -9,9 +9,12 @@ from .runner import Runner, Step
 from .session import Session
 from .tool import Tool, tool
 from .types import (
+    ContentPart,
+    ContentType,
     EventRole,
     EventType,
     GenerateConfig,
+    LLMChunk,
     LLMResponse,
     StepType,
     ThinkingConfig,
@@ -21,10 +24,13 @@ from .types import (
 
 __all__ = [
     "Agent",
+    "ContentPart",
+    "ContentType",
     "Event",
     "EventRole",
     "EventType",
     "GenerateConfig",
+    "LLMChunk",
     "LLMResponse",
     "RouteContext",
     "Router",

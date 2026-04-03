@@ -5,12 +5,12 @@ These tests make actual API calls and cost money. Run with:
     pytest -m e2e -v
 """
 
+import json
+
 import pytest
 
-from spindle import Agent, Runner, Session, StepType, tool
+from spindle import Agent, GenerateConfig, Runner, Session, StepType, ThinkingConfig, tool
 from spindle.llm.gemini import GeminiLLM
-from spindle.types import GenerateConfig, ThinkingConfig
-
 
 pytestmark = pytest.mark.e2e
 
@@ -60,8 +60,9 @@ class TestBasicResponse:
 
         steps = [step async for step in runner.run(session, "Hello!")]
         assert len(steps) >= 1
-        assert steps[-1].type == StepType.LLM_RESPONSE
-        assert len(steps[-1].content) > 0
+        response_steps = [s for s in steps if s.type == StepType.LLM_RESPONSE]
+        assert len(response_steps) >= 1
+        assert len(response_steps[-1].content) > 0
 
     async def test_follows_system_prompt(self):
         llm = GeminiLLM(model="gemini-2.0-flash")
@@ -74,7 +75,8 @@ class TestBasicResponse:
         session = Session(id="s1", user_id="u1")
 
         steps = [step async for step in runner.run(session, "ping")]
-        assert "PONG" in steps[-1].content.upper()
+        response_steps = [s for s in steps if s.type == StepType.LLM_RESPONSE]
+        assert "PONG" in response_steps[-1].content.upper()
 
 
 # -- Tool Calling -----------------------------------------------------------
@@ -96,7 +98,10 @@ class TestToolCalling:
         steps = [step async for step in runner.run(session, "What's the weather in Riyadh?")]
         step_types = [s.type for s in steps]
 
-        assert StepType.TOOL_CALL in step_types
+        # Tool calls are on the LLM_RESPONSE step
+        llm_steps = [s for s in steps if s.type == StepType.LLM_RESPONSE]
+        assert any(s.tool_calls for s in llm_steps)
+
         assert StepType.TOOL_RESULT in step_types
         assert StepType.LLM_RESPONSE in step_types
 
@@ -183,7 +188,7 @@ class TestPerMessageControls:
                 system_prompt="Always respond with exactly 'HELLO WORLD' and nothing else.",
             )
         ]
-        final = steps[-1]
+        final = [s for s in steps if s.type == StepType.LLM_RESPONSE][-1]
         assert "HELLO" in final.content.upper()
 
     async def test_override_tools(self):
@@ -229,5 +234,86 @@ class TestThinking:
                 config=config,
             )
         ]
-        # Should get a response (thinking may or may not be exposed)
-        assert any(s.type == StepType.LLM_RESPONSE for s in steps)
+        response = [s for s in steps if s.type == StepType.LLM_RESPONSE][-1]
+        assert response.content is not None
+        assert "paris" in response.content.lower()
+
+
+# -- Structured Output -----------------------------------------------------
+
+
+class TestStructuredOutput:
+    async def test_json_schema_response(self):
+        llm = GeminiLLM(model="gemini-2.0-flash")
+        agent = Agent(
+            name="test",
+            llm=llm,
+            instruction="Extract the person's name and age from the text.",
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        config = GenerateConfig(
+            response_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age": {"type": "integer"},
+                },
+                "required": ["name", "age"],
+            }
+        )
+        steps = [
+            step
+            async for step in runner.run(
+                session,
+                "Ahmed is 28 years old.",
+                config=config,
+            )
+        ]
+        response = [s for s in steps if s.type == StepType.LLM_RESPONSE][-1]
+        data = json.loads(response.content)
+        assert data["name"].lower() == "ahmed"
+        assert data["age"] == 28
+
+
+# -- Streaming -------------------------------------------------------------
+
+
+class TestStreaming:
+    async def test_streaming_returns_chunks_and_response(self):
+        llm = GeminiLLM(model="gemini-2.0-flash")
+        agent = Agent(
+            name="test",
+            llm=llm,
+            instruction="Say hello briefly.",
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "Hi!", stream=True)]
+
+        chunk_steps = [s for s in steps if s.type == StepType.LLM_CHUNK]
+        response_steps = [s for s in steps if s.type == StepType.LLM_RESPONSE]
+
+        assert len(chunk_steps) >= 1
+        assert len(response_steps) == 1
+        assert all(s.partial for s in chunk_steps)
+        assert not response_steps[0].partial
+
+    async def test_streaming_with_tool_call(self):
+        llm = GeminiLLM(model="gemini-2.0-flash")
+        agent = Agent(
+            name="test",
+            llm=llm,
+            instruction="Use tools when asked. Be brief.",
+            tools=[add_numbers],
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "What is 3 + 4?", stream=True)]
+        step_types = [s.type for s in steps]
+
+        assert StepType.LLM_RESPONSE in step_types
+        assert StepType.TOOL_RESULT in step_types
