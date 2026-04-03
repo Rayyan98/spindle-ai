@@ -9,6 +9,7 @@ from .runner import Runner, Step
 from .session import Session
 from .tool import Tool, tool
 from .types import (
+    CodeExecution,
     ContentPart,
     ContentType,
     EventRole,
@@ -24,6 +25,7 @@ from .types import (
 
 __all__ = [
     "Agent",
+    "CodeExecution",
     "ContentPart",
     "ContentType",
     "Event",

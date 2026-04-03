@@ -16,7 +16,7 @@ from typing import Any, AsyncGenerator
 from .agent import Agent
 from .session import Session
 from .tool import Tool
-from .types import GenerateConfig, StepType, ToolCallData
+from .types import CodeExecution, GenerateConfig, StepType, ToolCallData
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ class Step:
     type: StepType
     content: str | None = None
     tool_calls: list[ToolCallData] | None = None
+    code_executions: list[CodeExecution] | None = None
     tool_name: str | None = None
     tool_args: dict[str, Any] | None = None
     tool_result: Any = None
@@ -114,6 +115,7 @@ class Runner:
                     type=StepType.LLM_RESPONSE,
                     content=llm_response.content,
                     tool_calls=llm_response.tool_calls,
+                    code_executions=llm_response.code_executions,
                     usage=llm_response.usage,
                     thinking=llm_response.thinking,
                 )

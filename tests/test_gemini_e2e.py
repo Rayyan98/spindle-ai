@@ -317,3 +317,38 @@ class TestStreaming:
 
         assert StepType.LLM_RESPONSE in step_types
         assert StepType.TOOL_RESULT in step_types
+
+
+# -- Code Execution --------------------------------------------------------
+
+
+class TestCodeExecution:
+    async def test_code_execution_returns_result(self):
+        llm = GeminiLLM(model="gemini-2.0-flash")
+        agent = Agent(
+            name="test",
+            llm=llm,
+            instruction="Use code execution to compute the answer. Be brief.",
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        config = GenerateConfig(code_execution=True)
+        steps = [
+            step
+            async for step in runner.run(
+                session,
+                "What is the 10th fibonacci number? Use code to compute it.",
+                config=config,
+            )
+        ]
+
+        response = [s for s in steps if s.type == StepType.LLM_RESPONSE][-1]
+        assert response.content is not None
+        # The model should have executed code
+        all_code_execs = [
+            s.code_executions
+            for s in steps
+            if s.type == StepType.LLM_RESPONSE and s.code_executions
+        ]
+        assert len(all_code_execs) >= 1

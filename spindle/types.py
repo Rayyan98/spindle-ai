@@ -67,7 +67,17 @@ class GenerateConfig(BaseModel):
     stop_sequences: list[str] | None = None
     thinking: ThinkingConfig | None = None
     response_schema: dict[str, Any] | None = None
+    code_execution: bool = False
     provider_config: dict[str, Any] | None = None
+
+
+class CodeExecution(BaseModel):
+    """Code written and executed by the LLM server-side."""
+
+    code: str
+    language: str = "python"
+    output: str | None = None
+    outcome: str | None = None
 
 
 class UsageMetadata(BaseModel):
@@ -92,6 +102,7 @@ class LLMResponse(BaseModel):
 
     content: str | None = None
     tool_calls: list[ToolCallData] | None = None
+    code_executions: list[CodeExecution] | None = None
     usage: UsageMetadata | None = None
     thinking: str | None = None
     model: str | None = None
@@ -102,6 +113,7 @@ class LLMChunk(BaseModel):
 
     content_delta: str | None = None
     tool_calls: list[ToolCallData] | None = None
+    code_executions: list[CodeExecution] | None = None
     thinking_delta: str | None = None
     usage: UsageMetadata | None = None
     finished: bool = False

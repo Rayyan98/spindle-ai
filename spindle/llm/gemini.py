@@ -16,6 +16,7 @@ from google.genai import types
 from ..event import Event
 from ..tool import Tool
 from ..types import (
+    CodeExecution,
     ContentType,
     EventRole,
     EventType,
@@ -84,6 +85,8 @@ class GeminiLLM(LLM):
         gen_config = _build_generate_config(system_prompt, tools, config)
 
         accumulated_tool_calls: list[ToolCallData] = []
+        accumulated_code_executions: list[CodeExecution] = []
+        pending_code: str | None = None
         last_usage: UsageMetadata | None = None
 
         async for chunk in await self._client.aio.models.generate_content_stream(
@@ -108,6 +111,20 @@ class GeminiLLM(LLM):
                                     else {},
                                 )
                             )
+                        elif part.executable_code:
+                            pending_code = part.executable_code.code or ""
+                        elif part.code_execution_result:
+                            accumulated_code_executions.append(
+                                CodeExecution(
+                                    code=pending_code or "",
+                                    language="python",
+                                    output=part.code_execution_result.output,
+                                    outcome=str(part.code_execution_result.outcome)
+                                    if part.code_execution_result.outcome
+                                    else None,
+                                )
+                            )
+                            pending_code = None
                         elif part.thought:
                             thinking_delta = part.text or ""
                         elif part.text:
@@ -127,9 +144,10 @@ class GeminiLLM(LLM):
                 finished=False,
             )
 
-        # Final chunk with accumulated tool calls and usage
+        # Final chunk with accumulated tool calls, code executions, and usage
         yield LLMChunk(
             tool_calls=accumulated_tool_calls if accumulated_tool_calls else None,
+            code_executions=accumulated_code_executions if accumulated_code_executions else None,
             usage=last_usage,
             finished=True,
         )
@@ -305,6 +323,10 @@ def _build_generate_config(
         if config.response_schema:
             kwargs["response_mime_type"] = "application/json"
             kwargs["response_schema"] = config.response_schema
+        if config.code_execution:
+            code_exec_tool = types.Tool(code_execution=types.ToolCodeExecution())
+            existing_tools = kwargs.get("tools", [])
+            kwargs["tools"] = existing_tools + [code_exec_tool]
 
     return types.GenerateContentConfig(**kwargs)
 
@@ -316,6 +338,7 @@ def _parse_response(response: types.GenerateContentResponse) -> LLMResponse:
     """Convert Gemini response to Spindle LLMResponse."""
     content_text: str | None = None
     tool_calls: list[ToolCallData] | None = None
+    code_executions: list[CodeExecution] | None = None
     thinking_text: str | None = None
 
     if response.candidates:
@@ -324,6 +347,8 @@ def _parse_response(response: types.GenerateContentResponse) -> LLMResponse:
             text_parts = []
             thinking_parts = []
             tc_list = []
+            ce_list: list[CodeExecution] = []
+            pending_code: str | None = None
 
             for part in candidate.content.parts:
                 if part.function_call:
@@ -334,6 +359,20 @@ def _parse_response(response: types.GenerateContentResponse) -> LLMResponse:
                             args=dict(part.function_call.args) if part.function_call.args else {},
                         )
                     )
+                elif part.executable_code:
+                    pending_code = part.executable_code.code or ""
+                elif part.code_execution_result:
+                    ce_list.append(
+                        CodeExecution(
+                            code=pending_code or "",
+                            language="python",
+                            output=part.code_execution_result.output,
+                            outcome=str(part.code_execution_result.outcome)
+                            if part.code_execution_result.outcome
+                            else None,
+                        )
+                    )
+                    pending_code = None
                 elif part.thought:
                     thinking_parts.append(part.text or "")
                 elif part.text:
@@ -343,6 +382,8 @@ def _parse_response(response: types.GenerateContentResponse) -> LLMResponse:
                 content_text = "".join(text_parts)
             if tc_list:
                 tool_calls = tc_list
+            if ce_list:
+                code_executions = ce_list
             if thinking_parts:
                 thinking_text = "".join(thinking_parts)
 
@@ -358,6 +399,7 @@ def _parse_response(response: types.GenerateContentResponse) -> LLMResponse:
     return LLMResponse(
         content=content_text,
         tool_calls=tool_calls,
+        code_executions=code_executions,
         usage=usage,
         thinking=thinking_text,
         model=response.model_version if hasattr(response, "model_version") else None,

@@ -6,6 +6,7 @@ from spindle.runner import Runner
 from spindle.session import Session
 from spindle.tool import tool
 from spindle.types import (
+    CodeExecution,
     EventType,
     GenerateConfig,
     LLMChunk,
@@ -471,6 +472,69 @@ class TestThinking:
         agent_event = session.events[1]
         assert agent_event.metadata is not None
         assert agent_event.metadata["thinking"] == "The answer to everything"
+
+
+# -- Code Execution ---------------------------------------------------------
+
+
+class TestCodeExecution:
+    async def test_code_execution_flows_to_step(self):
+        agent = _make_agent(
+            [
+                LLMResponse(
+                    content="The result is 120.",
+                    code_executions=[
+                        CodeExecution(
+                            code="import math\nprint(math.factorial(5))",
+                            language="python",
+                            output="120\n",
+                            outcome="OUTCOME_OK",
+                        )
+                    ],
+                )
+            ]
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "what is 5 factorial?")]
+        assert steps[0].type == StepType.LLM_RESPONSE
+        assert steps[0].content == "The result is 120."
+        assert steps[0].code_executions is not None
+        assert len(steps[0].code_executions) == 1
+        assert steps[0].code_executions[0].code == "import math\nprint(math.factorial(5))"
+        assert steps[0].code_executions[0].output == "120\n"
+        assert steps[0].code_executions[0].outcome == "OUTCOME_OK"
+
+    async def test_code_execution_with_tool_calls(self):
+        """Code execution and tool calls can coexist in one response."""
+        agent = _make_agent(
+            [
+                LLMResponse(
+                    content="Here's the analysis.",
+                    tool_calls=[
+                        ToolCallData(id="c1", name="search", args={"query": "data"}),
+                    ],
+                    code_executions=[
+                        CodeExecution(code="print(2+2)", output="4\n", outcome="OUTCOME_OK")
+                    ],
+                ),
+                LLMResponse(content="Done."),
+            ],
+            tools=[search],
+        )
+        runner = Runner(agent=agent)
+        session = Session(id="s1", user_id="u1")
+
+        steps = [step async for step in runner.run(session, "analyze")]
+        first = steps[0]
+        assert first.tool_calls is not None
+        assert first.code_executions is not None
+
+    async def test_code_execution_config_flag(self):
+        """GenerateConfig.code_execution=True should be passable."""
+        config = GenerateConfig(code_execution=True)
+        assert config.code_execution is True
 
 
 # -- Streaming --------------------------------------------------------------
